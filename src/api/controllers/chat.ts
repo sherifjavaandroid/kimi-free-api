@@ -12,6 +12,62 @@ import util from '@/lib/util.ts';
 
 // 模型名称
 const MODEL_NAME = 'kimi';
+
+// 模型配置接口
+interface ModelConfig {
+  kimiplus_id: string;
+  use_search: boolean;
+  is_pro_search: boolean;
+  use_research: boolean;
+  silent_search: boolean;
+}
+
+/**
+ * 解析模型名称，提取模型配置
+ *
+ * 支持的模型名称格式：
+ * - kimi (默认)
+ * - kimi-k1.5 (深度思考模型)
+ * - kimi-k2.5 (最新标准模型)
+ * - kimi-k2.5-vision (视觉模型)
+ * - moonshot-v1[-8k|-32k|-128k|-vision] (兼容旧版)
+ *
+ * 支持的修饰符（可组合）：
+ * - search: 启用联网搜索
+ * - research: 启用探索版（深度搜索）
+ * - k1 / k1.5: 启用深度思考（K1模式）
+ * - silent: 不输出搜索过程
+ *
+ * @param model 模型名称
+ * @param defaultUseSearch 默认是否启用搜索
+ */
+function parseModelConfig(model: string, defaultUseSearch: boolean = true): ModelConfig {
+  const modelLower = model.toLowerCase();
+
+  // 如果是20位字母数字的kimiplus_id，直接使用
+  if (/^[0-9a-z]{20}$/.test(model)) {
+    return {
+      kimiplus_id: model,
+      use_search: defaultUseSearch,
+      is_pro_search: false,
+      use_research: false,
+      silent_search: false,
+    };
+  }
+
+  const isK1 = /k1(\.5)?/.test(modelLower);
+  const isResearch = modelLower.includes('research');
+  const isSilent = modelLower.includes('silent');
+  const hasSearchFlag = modelLower.includes('search');
+
+  return {
+    kimiplus_id: 'kimi',
+    use_search: hasSearchFlag ? true : defaultUseSearch,
+    is_pro_search: isResearch,
+    use_research: isK1,
+    silent_search: isSilent,
+  };
+}
 // access_token有效期
 const ACCESS_TOKEN_EXPIRES = 300;
 // 最大重试次数
@@ -54,6 +110,19 @@ async function requestToken(refreshToken: string) {
   accessTokenRequestQueueMap[refreshToken] = [];
   logger.info(`Refresh token: ${refreshToken}`);
   const result = await (async () => {
+    // Accept an access token directly (skip the refresh step) when the provided
+    // token already works as an access token — e.g. Kimi access tokens or
+    // overseas kimi.com accounts that don't expose the refresh flow.
+    try {
+      const { id: directUserId } = await getUserInfo(refreshToken, refreshToken);
+      if (directUserId)
+        return {
+          userId: directUserId,
+          accessToken: refreshToken,
+          refreshToken,
+          refreshTime: util.unixTimestamp() + ACCESS_TOKEN_EXPIRES
+        };
+    } catch (e) { /* not a usable access token — fall back to refresh flow */ }
     const result = await axios.get('https://kimi.moonshot.cn/api/auth/token/refresh', {
       headers: {
         Accept: '*/*',
@@ -154,7 +223,7 @@ async function getUserInfo(accessToken: string, refreshToken: string) {
  * 
  * @param refreshToken 用于刷新access_token的refresh_token
  */
-async function createConversation(model: string, name: string, refreshToken: string) {
+async function createConversation(modelConfig: ModelConfig, name: string, refreshToken: string) {
   const {
     accessToken,
     userId
@@ -162,7 +231,7 @@ async function createConversation(model: string, name: string, refreshToken: str
   const result = await axios.post('https://kimi.moonshot.cn/api/chat', {
     born_from: '',
     is_example: false,
-    kimiplus_id: /^[0-9a-z]{20}$/.test(model) ? model : 'kimi',
+    kimiplus_id: modelConfig.kimiplus_id,
     name
   }, {
     headers: {
@@ -250,6 +319,9 @@ async function createCompletion(model = MODEL_NAME, messages: any[], refreshToke
   return (async () => {
     logger.info(messages);
 
+    // 解析模型配置
+    const modelConfig = parseModelConfig(model, useSearch);
+
     // 提取引用文件URL并上传kimi获得引用的文件ID列表
     const refFileUrls = extractRefFileUrls(messages);
     const refs = refFileUrls.length ? await Promise.all(refFileUrls.map(fileUrl => uploadFile(fileUrl, refreshToken))) : [];
@@ -259,7 +331,7 @@ async function createCompletion(model = MODEL_NAME, messages: any[], refreshToke
       .catch(err => logger.error(err));
 
     // 创建会话
-    const convId = /[0-9a-zA-Z]{20}/.test(refConvId) ? refConvId : await createConversation(model, "未命名会话", refreshToken);
+    const convId = /[0-9a-zA-Z]{20}/.test(refConvId) ? refConvId : await createConversation(modelConfig, "未命名会话", refreshToken);
 
     // 请求流
     const {
@@ -268,11 +340,12 @@ async function createCompletion(model = MODEL_NAME, messages: any[], refreshToke
     } = await acquireToken(refreshToken);
     const sendMessages = messagesPrepare(messages, !!refConvId);
     const result = await axios.post(`https://kimi.moonshot.cn/api/chat/${convId}/completion/stream`, {
-      kimiplus_id: /^[0-9a-z]{20}$/.test(model) ? model : 'kimi',
+      kimiplus_id: modelConfig.kimiplus_id,
       messages: sendMessages,
       refs,
-      is_pro_search: false,
-      use_search: useSearch
+      is_pro_search: modelConfig.is_pro_search,
+      use_search: modelConfig.use_search,
+      use_research: modelConfig.use_research
     }, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -290,7 +363,7 @@ async function createCompletion(model = MODEL_NAME, messages: any[], refreshToke
 
     const streamStartTime = util.timestamp();
     // 接收流为输出文本
-    const answer = await receiveStream(model, convId, result.data);
+    const answer = await receiveStream(model, convId, result.data, modelConfig.silent_search);
     logger.success(`Stream has completed transfer ${util.timestamp() - streamStartTime}ms`);
 
     // 异步移除会话，如果消息不合规，此操作可能会抛出数据库错误异常，请忽略
@@ -329,6 +402,9 @@ async function createCompletionStream(model = MODEL_NAME, messages: any[], refre
   return (async () => {
     logger.info(messages);
 
+    // 解析模型配置
+    const modelConfig = parseModelConfig(model, useSearch);
+
     // 提取引用文件URL并上传kimi获得引用的文件ID列表
     const refFileUrls = extractRefFileUrls(messages);
     const refs = refFileUrls.length ? await Promise.all(refFileUrls.map(fileUrl => uploadFile(fileUrl, refreshToken))) : [];
@@ -338,7 +414,7 @@ async function createCompletionStream(model = MODEL_NAME, messages: any[], refre
       .catch(err => logger.error(err));
 
     // 创建会话
-    const convId = /[0-9a-zA-Z]{20}/.test(refConvId) ? refConvId : await createConversation(model, "未命名会话", refreshToken);
+    const convId = /[0-9a-zA-Z]{20}/.test(refConvId) ? refConvId : await createConversation(modelConfig, "未命名会话", refreshToken);
 
     // 请求流
     const {
@@ -347,10 +423,12 @@ async function createCompletionStream(model = MODEL_NAME, messages: any[], refre
     } = await acquireToken(refreshToken);
     const sendMessages = messagesPrepare(messages, !!refConvId);
     const result = await axios.post(`https://kimi.moonshot.cn/api/chat/${convId}/completion/stream`, {
-      kimiplus_id: /^[0-9a-z]{20}$/.test(model) ? model : undefined,
+      kimiplus_id: modelConfig.kimiplus_id,
       messages: sendMessages,
       refs,
-      use_search: useSearch
+      is_pro_search: modelConfig.is_pro_search,
+      use_search: modelConfig.use_search,
+      use_research: modelConfig.use_research
     }, {
       // 120秒超时
       timeout: 120000,
@@ -367,7 +445,7 @@ async function createCompletionStream(model = MODEL_NAME, messages: any[], refre
     });
     const streamStartTime = util.timestamp();
     // 创建转换流将消息格式转换为gpt兼容格式
-    return createTransStream(model, convId, result.data, () => {
+    return createTransStream(model, convId, result.data, modelConfig.silent_search, () => {
       logger.success(`Stream has completed transfer ${util.timestamp() - streamStartTime}ms`);
       // 流传输结束后异步移除会话，如果消息不合规，此操作可能会抛出数据库错误异常，请忽略
       // 如果引用会话将不会清除，因为我们不知道什么时候你会结束会话
@@ -722,7 +800,7 @@ function checkResult(result: AxiosResponse, refreshToken: string) {
  * @param convId 会话ID
  * @param stream 消息流
  */
-async function receiveStream(model: string, convId: string, stream: any) {
+async function receiveStream(model: string, convId: string, stream: any, silentSearch: boolean = false) {
   let webSearchCount = 0;
   return new Promise((resolve, reject) => {
     // 消息初始化
@@ -737,7 +815,6 @@ async function receiveStream(model: string, convId: string, stream: any) {
       created: util.unixTimestamp()
     };
     let refContent = '';
-    const silentSearch = model.indexOf('silent_search') != -1;
     const parser = createParser(event => {
       try {
         if (event.type !== "event") return;
@@ -786,14 +863,13 @@ async function receiveStream(model: string, convId: string, stream: any) {
  * @param stream 消息流
  * @param endCallback 传输结束回调
  */
-function createTransStream(model: string, convId: string, stream: any, endCallback?: Function) {
+function createTransStream(model: string, convId: string, stream: any, silentSearch: boolean = false, endCallback?: Function) {
   // 消息创建时间
   const created = util.unixTimestamp();
   // 创建转换流
   const transStream = new PassThrough();
   let webSearchCount = 0;
   let searchFlag = false;
-  const silentSearch = model.indexOf('silent_search') != -1;
   !transStream.closed && transStream.write(`data: ${JSON.stringify({
     id: convId,
     model,
@@ -810,6 +886,10 @@ function createTransStream(model: string, convId: string, stream: any, endCallba
       const result = _.attempt(() => JSON.parse(event.data));
       if (_.isError(result))
         throw new Error(`Stream response invalid: ${event.data}`);
+      // 日志记录 append/set 事件（调试用）
+      if (result.event === 'append' || result.event === 'set') {
+        logger.info(`[Stream Event] type=${result.event}, path=${result.path}, view=${result.view}, value=${JSON.stringify(result.value).substring(0, 300)}`);
+      }
       // 处理消息
       if (result.event == 'cmpl') {
         const exceptCharIndex = result.text.indexOf("�");
